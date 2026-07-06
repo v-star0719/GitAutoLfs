@@ -1,0 +1,207 @@
+#!/bin/bash
+set -euo pipefail
+
+# ========== 配置项 ==========
+# 大小阈值：128KB = 131072 字节
+SIZE_THRESHOLD=131072
+MAX_ARG_CHARS=12000
+
+# ============================
+
+# 定位类型定义文件
+REPO_ROOT=$(git rev-parse --show-toplevel)
+TYPES_BINARY="$REPO_ROOT/FileTypes_Binary.md"
+TYPES_TEXT="$REPO_ROOT/FileTypes_Text.md"
+
+# 检查类型定义文件是否存在
+if [ ! -f "$TYPES_BINARY" ]; then
+  echo "[LFS Hook] 错误：未找到 FileTypes_Binary.md" >&2
+  exit 1
+fi
+if [ ! -f "$TYPES_TEXT" ]; then
+  echo "[LFS Hook] 错误：未找到 FileTypes_Text.md" >&2
+  exit 1
+fi
+
+# ============================================================================
+# 解析类型定义文件 → 构建临时 .gitattributes 树
+#   FileTypes_Binary.md / FileTypes_Text.md 中的每个非空、非注释行都按
+#   .gitattributes pattern 解析，例如：
+#     *.png
+#     Assets/**
+#     config/appsettings.json
+#     Dockerfile
+# ============================================================================
+TYPE_ATTR="codex-lfs-type"
+
+emit_attr_lines() {
+  local file="$1"
+  local type_label="$2"   # "binary" or "text"
+  local line
+  local pattern
+
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%$'\r'}"
+    pattern="${line#"${line%%[![:space:]]*}"}"
+    pattern="${pattern%"${pattern##*[![:space:]]}"}"
+    [ -z "$pattern" ] && continue
+    [[ "$pattern" == \#* ]] && continue
+
+    printf '%s %s=%s\n' "$pattern" "$TYPE_ATTR" "$type_label"
+  done < "$file"
+}
+
+ATTR_BLOB=$(
+  {
+    # 后写入的 pattern 按 .gitattributes 规则覆盖先写入的 pattern。
+    emit_attr_lines "$TYPES_BINARY" "binary"
+    emit_attr_lines "$TYPES_TEXT"  "text"
+  } | git hash-object -w --stdin
+)
+ATTR_TREE=$(printf '100644 blob %s\t.gitattributes\n' "$ATTR_BLOB" | git mktree)
+
+# ============================================================================
+# 检查 git-lfs 环境
+# ============================================================================
+if ! command -v git-lfs >/dev/null 2>&1; then
+  echo "[LFS Hook] 错误：未找到 git-lfs，请先执行 git lfs install" >&2
+  exit 1
+fi
+
+# ============================================================================
+# 1. 获取所有暂存的新增/修改文件（兼容带空格的文件名）
+# ============================================================================
+mapfile -d '' staged_files < <(git diff --cached --name-only --diff-filter=AM -z || true)
+if [ ${#staged_files[@]} -eq 0 ]; then
+  exit 0
+fi
+
+# 2. 分类：已由 .gitattributes 配置为 LFS 的文件跳过；
+#    其他文件按 FileTypes 中的 .gitattributes pattern 匹配路径 → 未匹配报错
+# ============================================================================
+
+declare -a binary_files=()
+declare -a unknown_files=()
+declare -A lfs_attr_map=()
+declare -A file_type_map=()
+
+while IFS= read -r -d '' attr_file &&
+      IFS= read -r -d '' attr_name &&
+      IFS= read -r -d '' attr_value; do
+  if [ "$attr_name" = "filter" ]; then
+    lfs_attr_map["$attr_file"]="$attr_value"
+  fi
+done < <(printf '%s\0' "${staged_files[@]}" | git check-attr -z --stdin filter)
+
+while IFS= read -r -d '' attr_file &&
+      IFS= read -r -d '' attr_name &&
+      IFS= read -r -d '' attr_value; do
+  if [ "$attr_name" = "$TYPE_ATTR" ]; then
+    file_type_map["$attr_file"]="$attr_value"
+  fi
+done < <(printf '%s\0' "${staged_files[@]}" | git check-attr -z --source="$ATTR_TREE" --stdin "$TYPE_ATTR")
+
+for file in "${staged_files[@]}"; do
+  [ -f "$file" ] || continue
+
+  if [ "${lfs_attr_map[$file]:-}" = "lfs" ]; then
+    continue
+  fi
+
+  case "${file_type_map[$file]:-unspecified}" in
+    binary)
+      binary_files+=("$file")
+      ;;
+    text)
+      ;;
+    unspecified)
+      unknown_files+=("$file")
+      ;;
+    *)
+      echo "[LFS Hook] 错误：$file 匹配到无效类型：${file_type_map[$file]}" >&2
+      exit 1
+      ;;
+  esac
+done
+
+# ============================================================================
+# 3. 未知类型文件 → 报错退出
+# ============================================================================
+if [ ${#unknown_files[@]} -gt 0 ]; then
+  echo "[LFS Hook] 错误：以下文件的类型未在 FileTypes_Binary.md 或 FileTypes_Text.md 中定义：" >&2
+  for f in "${unknown_files[@]}"; do
+    echo "    $f" >&2
+  done
+  exit 1
+fi
+
+# ============================================================================
+# 4. 没有二进制文件 → 跳过 LFS 检查
+# ============================================================================
+if [ ${#binary_files[@]} -eq 0 ]; then
+  exit 0
+fi
+
+# ============================================================================
+# 5. 批量获取暂存区中所有文件的大小
+# ============================================================================
+declare -A size_map
+batch_input=""
+for file in "${binary_files[@]}"; do
+  batch_input+=":$file $file"$'\n'
+done
+
+while IFS=' ' read -r size file; do
+  if [ -n "$file" ] && [ -n "$size" ]; then
+    size_map["$file"]="$size"
+  fi
+done < <(printf '%s' "$batch_input" | git cat-file --batch-check='%(objectsize) %(rest)' 2>/dev/null || true)
+
+# ============================================================================
+# 6. 筛选需要加入 LFS 的文件（超过阈值）
+# ============================================================================
+declare -a need_track=()
+for file in "${binary_files[@]}"; do
+  file_size="${size_map[$file]:-0}"
+  if [ "$file_size" -lt "$SIZE_THRESHOLD" ]; then
+    continue
+  fi
+
+  need_track+=("$file")
+  echo "[LFS Hook] 检测到大二进制文件: $file (${file_size} bytes)，自动加入 LFS"
+done
+
+# ============================================================================
+# 7. 批量加入 LFS 追踪并重新暂存
+# ============================================================================
+if [ ${#need_track[@]} -gt 0 ]; then
+  chunk=()
+  chunk_chars=0
+  for file in "${need_track[@]}"; do
+    file_chars=${#file}
+    if [ ${#chunk[@]} -gt 0 ] && [ $((chunk_chars + file_chars + 1)) -gt "$MAX_ARG_CHARS" ]; then
+      git lfs track --filename -- "${chunk[@]}" >/dev/null
+      chunk=()
+      chunk_chars=0
+    fi
+
+    chunk+=("$file")
+    chunk_chars=$((chunk_chars + file_chars + 1))
+  done
+
+  if [ ${#chunk[@]} -gt 0 ]; then
+    git lfs track --filename -- "${chunk[@]}" >/dev/null
+  fi
+
+  pathspec_file=$(mktemp)
+  trap 'rm -f "$pathspec_file"' EXIT
+  {
+    printf '.gitattributes\0'
+    printf '%s\0' "${need_track[@]}"
+  } > "$pathspec_file"
+  git add --pathspec-from-file="$pathspec_file" --pathspec-file-nul
+  rm -f "$pathspec_file"
+  trap - EXIT
+fi
+
+exit 0
