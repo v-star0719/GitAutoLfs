@@ -15,6 +15,9 @@
 #      python update_lfs_attributes.py --threshold-kb 256
 #   4. 输出全部未分类错误:
 #      python update_lfs_attributes.py --dry-run --max-errors 0
+#   5. 调整进度刷新频率，或关闭进度:
+#      python update_lfs_attributes.py --progress-interval 1000
+#      python update_lfs_attributes.py --no-progress
 
 from __future__ import annotations
 
@@ -24,6 +27,7 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -33,6 +37,7 @@ BEGIN_MARKER = "# Auto added LFS files. [begin]"
 END_MARKER = "# Auto added LFS files. [end]"
 LFS_ATTRIBUTES = "filter=lfs diff=lfs merge=lfs -text"
 DEFAULT_THRESHOLD_KB = 128
+DEFAULT_PROGRESS_INTERVAL = 1000
 
 
 @dataclass(frozen=True)
@@ -76,7 +81,9 @@ def parse_args() -> argparse.Namespace:
   python update_lfs_attributes.py --dry-run
   python update_lfs_attributes.py
   python update_lfs_attributes.py --threshold-kb 256
-  python update_lfs_attributes.py --dry-run --max-errors 0""",
+  python update_lfs_attributes.py --dry-run --max-errors 0
+  python update_lfs_attributes.py --progress-interval 1000
+  python update_lfs_attributes.py --no-progress""",
     )
     parser.add_argument(
         "--dry-run",
@@ -94,6 +101,17 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=200,
         help="最多输出多少条分类错误；传 0 表示不限制",
+    )
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="执行过程中不显示扫描进度",
+    )
+    parser.add_argument(
+        "--progress-interval",
+        type=int,
+        default=DEFAULT_PROGRESS_INTERVAL,
+        help=f"每处理多少个文件输出一次进度，默认 {DEFAULT_PROGRESS_INTERVAL}",
     )
     return parser.parse_args()
 
@@ -399,15 +417,29 @@ def classify_file(
 
 
 def escape_gitattributes_pattern(rel_path: str) -> str:
+    pattern = rel_path.replace("\\", "/")
     escaped: list[str] = []
-    for index, char in enumerate(rel_path.replace("\\", "/")):
-        if char in " \t*?[]\\":
-            escaped.append("\\" + char)
-        elif index == 0 and char in "#!":
-            escaped.append("\\" + char)
+    for char in pattern:
+        if char == "*":
+            escaped.append("[*]")
+        elif char == "?":
+            escaped.append("[?]")
+        elif char == "[":
+            escaped.append("[[]")
         else:
             escaped.append(char)
-    return "".join(escaped)
+
+    escaped_pattern = "".join(escaped)
+    needs_quote = (
+        any(char.isspace() for char in escaped_pattern)
+        or escaped_pattern.startswith(("#", "!"))
+        or '"' in escaped_pattern
+    )
+    if not needs_quote:
+        return escaped_pattern
+
+    quoted = escaped_pattern.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{quoted}"'
 
 
 def build_lfs_lines(rel_paths: Sequence[str]) -> list[str]:
@@ -445,10 +477,23 @@ def print_errors(errors: Sequence[str], max_errors: int) -> None:
         print(f"ERROR: ... {remaining} more error(s) omitted", file=sys.stderr)
 
 
+def print_progress(current: int, total: int, start_time: float) -> None:
+    elapsed = max(time.monotonic() - start_time, 0.001)
+    percent = 100.0 if total == 0 else current * 100.0 / total
+    rate = current / elapsed
+    print(
+        f"进度: {current}/{total} ({percent:.1f}%), 用时 {elapsed:.1f}s, {rate:.0f} 文件/s",
+        file=sys.stderr,
+    )
+
+
 def main() -> int:
     args = parse_args()
     if args.threshold_kb < 0:
-        print("ERROR: --threshold-kb must be non-negative", file=sys.stderr)
+        print("ERROR: --threshold-kb 不能为负数", file=sys.stderr)
+        return 1
+    if args.progress_interval <= 0:
+        print("ERROR: --progress-interval 必须大于 0", file=sys.stderr)
         return 1
 
     try:
@@ -471,16 +516,28 @@ def main() -> int:
         threshold_bytes = args.threshold_kb * 1024
         lfs_paths: list[str] = []
         errors: list[str] = []
+        show_progress = not args.no_progress
+        scan_start_time = time.monotonic()
+        last_progress = 0
 
-        for rel_path in scanned_paths:
+        if show_progress:
+            print(f"开始扫描 {len(scanned_paths)} 个文件...", file=sys.stderr)
+
+        for index, rel_path in enumerate(scanned_paths, start=1):
             file_type, error = classify_file(rel_path, text_patterns, binary_patterns)
             if error is not None:
                 errors.append(error)
-                continue
-            if file_type == "binary":
+            elif file_type == "binary":
                 size = (repo_root / rel_path).stat().st_size
                 if size > threshold_bytes:
                     lfs_paths.append(rel_path)
+
+            if show_progress and index % args.progress_interval == 0:
+                print_progress(index, len(scanned_paths), scan_start_time)
+                last_progress = index
+
+        if show_progress and last_progress != len(scanned_paths):
+            print_progress(len(scanned_paths), len(scanned_paths), scan_start_time)
 
         if errors:
             print_errors(errors, args.max_errors)
